@@ -13,12 +13,15 @@ class CoinCapPriceService: NSObject, URLSessionTaskDelegate {
     
     private let session = URLSession(configuration: .default)
     private var wsTask: URLSessionWebSocketTask?
+    private var pingTryCount = 0
     
-    private let coinDictionarySubject = CurrentValueSubject<[String: Coin], Never>([:])
-    private var coinDictionary: [String: Coin] {coinDictionarySubject.value}
+    let coinDictionarySubject = CurrentValueSubject<[String: Coin], Never>([:])
+    var coinDictionary: [String: Coin] {coinDictionarySubject.value}
     
-    private let connectionStateSubject = CurrentValueSubject<Bool, Never>(false)
-    private var isConnected: Bool {connectionStateSubject.value}
+    let connectionStateSubject = CurrentValueSubject<Bool, Never>(false)
+    var isConnected: Bool {connectionStateSubject.value}
+    
+    private let monitor = NWPathMonitor()
     
     func connect() {
         let coins = CoinType.allCases
@@ -30,12 +33,26 @@ class CoinCapPriceService: NSObject, URLSessionTaskDelegate {
         wsTask?.delegate = self
         wsTask?.resume()
         self.receiveMessage()
-
+        self.schedulePing()
+        
+    }
+    
+    func startMonitorNetworkConnectivity() {
+        monitor.pathUpdateHandler = {[weak self] path in
+            guard let self = self else {return }
+            if path.status == .satisfied, self.wsTask == nil {
+                self.connect()
+            }
+            if path.status != .satisfied {
+                self.clearConnection()
+            }
+        }
+        monitor.start(queue: .main)
     }
     
     private func receiveMessage() {
         wsTask?.receive {[weak self] result in
-           
+            
             guard let self = self else {return}
             
             switch result {
@@ -73,6 +90,42 @@ class CoinCapPriceService: NSObject, URLSessionTaskDelegate {
         
         let mergedDictionary = coinDictionary.merging(newDictionary) {$1}
         coinDictionarySubject.send(mergedDictionary)
+    }
+    
+    private func schedulePing() {
+        let identifier = self.wsTask?.taskIdentifier ?? -1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {[weak self ] in
+            guard let self = self, let task = self.wsTask, task.taskIdentifier == identifier
+            else {
+                return
+            }
+            if task.state == .running, self.pingTryCount < 2 {
+                self.pingTryCount += 1
+                print("Ping: Send ping \(self.pingTryCount)")
+                task.sendPing {[weak self] error in
+                    if let error = error {
+                        print("Ping failed: \(error.localizedDescription)")
+                    } else if self?.wsTask?.taskIdentifier == identifier {
+                        self?.pingTryCount = 0
+                    }
+                }
+                self.schedulePing()
+            } else {
+                self.reconnect()
+            }
+        }
+    }
+    
+    private func reconnect() {
+        self.clearConnection()
+        self.connect()
+    }
+    
+    func clearConnection() {
+        self.wsTask?.cancel()
+        self.wsTask = nil
+        self.pingTryCount = 0
+        self.connectionStateSubject.send(false)
     }
     
     deinit {
